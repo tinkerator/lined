@@ -12,16 +12,21 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
+	"strconv"
+	"sync"
 
 	"golang.org/x/term"
 )
 
 // Reader implements a line string reader.
 type Reader struct {
+	mu       sync.Mutex
 	h        []string
 	unread   []byte
 	offset   int
 	row, col int // size of screen (refreshed each time readString is called.
+	atR, atC int // last displayed cursor position.
 }
 
 // NewReader returns a new Reader that sources its data from
@@ -64,6 +69,11 @@ func (r *Reader) History(n int) (string, int) {
 	if r == nil {
 		return "", 0
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r == nil {
+		return "", 0
+	}
 	m := len(r.h)
 	if m < n || n < 0 {
 		return "", m
@@ -73,23 +83,29 @@ func (r *Reader) History(n int) (string, int) {
 
 // moves the cursor n columns up.
 func (r *Reader) up(n int) {
-	fmt.Printf("\033[%dA", n)
+	if n > 0 {
+		fmt.Printf("\033[%dA", n)
+	} else if n < 0 {
+		fmt.Printf("\033[%dB", -n)
+	}
 }
 
 // moves the cursor n columns down.
 func (r *Reader) down(n int) {
-	fmt.Printf("\033[%dB", n)
+	r.up(-n)
 }
 
 // moves the cursor n columns right.
 func (r *Reader) right(n int) {
-	fmt.Printf("\033[%dC", n)
+	r.left(-n)
 }
 
 // moves the cursor n columns left.
 func (r *Reader) left(n int) {
 	if n > 0 {
 		fmt.Printf("\033[%dD", n)
+	} else if n < 0 {
+		fmt.Printf("\033[%dC", -n)
 	}
 }
 
@@ -103,6 +119,11 @@ func (r *Reader) clearEOL() {
 	fmt.Print("\033[0K")
 }
 
+// clearLine clears all of the line the cursor is on
+func (r *Reader) clearLine() {
+	fmt.Print("\033[2K")
+}
+
 // ErrNoReader is the error return for a *Reader being nil.
 var (
 	ErrNoReader   = errors.New("no reader defined")
@@ -110,13 +131,26 @@ var (
 	ErrEOF        = errors.New("end of file")
 )
 
+// cursorAt is used to locate the cursor when the text input is being
+// first read.
+var cursorAt = regexp.MustCompile(`^(\d+);(\d+)R`)
+
 func (r *Reader) readString(echo bool) (string, error) {
+	if r == nil {
+		return "", ErrNoReader
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	var pick int
 	var orig *term.State
 	sc, err := os.Stdin.SyscallConn()
 	if err == nil {
 		sc.Control(func(fd uintptr) {
 			if fdi := int(fd); term.IsTerminal(fdi) {
+				if echo {
+					fmt.Print("\033[6n")
+				}
 				r.col, r.row, _ = term.GetSize(fdi)
 				// Disable input echo.
 				orig, _ = term.MakeRaw(fdi)
@@ -250,8 +284,10 @@ func (r *Reader) readString(echo bool) (string, error) {
 		},
 	}
 
-	// was holds the last iteration cursor position.
+	// was holds the last iteration offset position.
 	was := 0
+	// wasLines holds the last iteration number of lines
+	wasLines := 0
 	for {
 		if newline != -1 {
 			line := string(r.unread[:newline+1])
@@ -263,23 +299,9 @@ func (r *Reader) readString(echo bool) (string, error) {
 			return line, nil
 		}
 
-		// Only a partial line stored so display it again and
-		// accept more input.  move left r.offset and display
-		// r.unread. Then adjust the cursor position.
-
-		rs := bytes.Runes(r.unread)
-		n := len(rs)
-		if echo {
-			r.left(was)
-			fmt.Print(string(r.unread))
-			r.clearEOL()
-			r.left(n - r.offset)
-			was = r.offset
-		}
-
 		n, err := os.Stdin.Read(p[from:])
 		if n == 0 && err != nil {
-			log.Fatalf("TODO some sort of error has occurred: %v", err)
+			return "", err
 		}
 		from += n
 
@@ -288,7 +310,6 @@ func (r *Reader) readString(echo bool) (string, error) {
 				fmt.Print("^C")
 				return "", ErrTerminated
 			}
-
 			b := []byte{p[0]}
 			partial := false
 			found := false
@@ -330,12 +351,79 @@ func (r *Reader) readString(echo bool) (string, error) {
 				break
 			}
 
+			// Check for the initial cursor location. This
+			// is requested when we start servicing a
+			// prompt, but there is a race condition
+			// reading it, so we read it when we can.
+			if c, ok := match(p, "\033["); ok {
+				parts := cursorAt.FindSubmatch(p[c:])
+				if len(parts) == 3 {
+					row, err := strconv.Atoi(string(parts[1]))
+					if err != nil {
+						log.Fatalf("regexp returned invalid number: %q", parts[1])
+					}
+					col, err := strconv.Atoi(string(parts[2]))
+					if err != nil {
+						log.Fatalf("regexp returned invalid number: %q", parts[2])
+					}
+					c += len(parts[0])
+					copy(p[:], p[c:])
+					from -= c
+					r.atR = row
+					r.atC = col
+					continue
+				}
+			}
+
 			// Consume exactly one character of input.
 			b = append(b, r.unread[r.offset:]...)
 			r.unread = append(r.unread[:r.offset], b...)
 			r.offset++
 			copy(p[:], p[1:])
 			from--
+		}
+
+		if newline == -1 && echo {
+			w := r.col - 1
+
+			// zero base the coordinate of the prompt.
+			cOffset := r.atC - 1
+
+			// return to line start
+			cD := (was - 1 + cOffset) % w
+			cAt := cD + 1 - cOffset
+			cUp := (was - 1 + cOffset) / w
+
+			r.up(cUp)
+			r.left(cAt)
+
+			rs := bytes.Runes(r.unread)
+			n := len(rs) // runes to print (for now assume runes are 1 column wide)
+
+			// display full line content
+			cAt = ((n - 1 + cOffset) % w) - ((r.offset - 1 + cOffset) % w)
+			cUp = (n-1+cOffset)/w - (r.offset-1+cOffset)/w
+			was = r.offset
+			lines := 0
+			for i, u := range rs {
+				ch := string(u)
+				if at := (i + cOffset) % w; at == 0 {
+					fmt.Print("\\\r\n")
+					lines++
+				}
+				fmt.Print(ch)
+			}
+			r.clearEOL()
+			if wasLines > lines {
+				for i := lines; i < wasLines; i++ {
+					r.down(1)
+					r.clearLine()
+				}
+				r.up(cUp + wasLines - lines)
+			}
+			r.up(cUp)
+			r.left(cAt)
+			wasLines = lines
 		}
 	}
 }
