@@ -407,7 +407,7 @@ func (r *Reader) readString(echo bool) (string, error) {
 			lines := 0
 			for i, u := range rs {
 				ch := string(u)
-				if at := (i + cOffset) % w; at == 0 {
+				if at := (i + cOffset) % w; i != 0 && at == 0 {
 					fmt.Print("\\\r\n")
 					lines++
 				}
